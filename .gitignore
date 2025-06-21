@@ -1,0 +1,14 @@
+
+#Exports
+*.cpg
+*.dbf
+*.prj
+*.shp
+*.shx
+
+#Compiling results
+/dist
+/build
+
+#pycharm setups
+.idea/
