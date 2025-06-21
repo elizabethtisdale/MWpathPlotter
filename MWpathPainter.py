@@ -16,7 +16,22 @@ import geopandas as gpd
 from shapely.geometry import LineString
 
 
-# --- NO CHANGES IN THESE FUNCTIONS ---
+import sys
+import os
+
+# This block sets the necessary environment variables for GDAL and PROJ
+# to work correctly when the application is packaged with PyInstaller. (Thanks Gemini)
+if getattr(sys, 'frozen', False):
+    # If the application is run as a bundle, the PyInstaller bootloader
+    # extends the sys module by a flag frozen=True and sets the app path.
+
+    # Add the unpacked C-libraries folder to the system's PATH
+    os.environ['PATH'] = sys._MEIPASS + os.pathsep + os.environ['PATH']
+
+    # Set the PROJ and GDAL data paths
+    os.environ['PROJ_LIB'] = os.path.join(sys._MEIPASS, 'proj')
+    os.environ['GDAL_DATA'] = os.path.join(sys._MEIPASS, 'gdal')
+
 
 def get_utm_epsg_code(lon):
     """Calculates the appropriate UTM EPSG code for a given longitude."""
