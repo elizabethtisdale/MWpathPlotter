@@ -1,4 +1,5 @@
 import matplotlib
+from pandas.tseries import frequencies
 
 matplotlib.use('TkAgg')  #Use the Tkinter backend
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -15,6 +16,21 @@ import os
 import geopandas as gpd
 from shapely.geometry import LineString
 import sys
+import numpy as np
+from matplotlib.patches import Ellipse
+import zipfile
+import contextily as ctx
+from shapely.geometry import LineString, Point
+from matplotlib.widgets import Button
+import time
+
+# global abriables for dragging detection
+is_dragging = [False]
+last_mouse_press_pos = [None]
+# hover global variables
+last_hover_time = 0
+hover_interval = 0.5  # 500 ms
+
 
 
 # This block sets the necessary environment variables for GDAL and PROJ
@@ -78,6 +94,7 @@ def get_list_of_paths(df, to_utm):
     """
     paths = []
     additional_info = []
+    frequencies = []
 
     for i, row in df.iterrows():
         # Transform geographic coordinates to UTM for plotting
@@ -90,8 +107,50 @@ def get_list_of_paths(df, to_utm):
         paths.append((transmitter_coordinate, receiver_coordinate))
         additional_info.append((row['Callsign'], row['Path No.']))
 
-    return paths, additional_info
+        frequencies.append(row['f (MHz)'])
 
+    return paths, additional_info, frequencies
+
+# fresnel zone 2 radius calculation
+def fresnel_zone2_radius(freq_mhz, d1, d2):
+    # get wavelength
+    c = 3e8  # speed of light in m/s
+    f_hz = freq_mhz * 1e6  # convert MHz to Hz
+    wavelength = c / f_hz
+
+    # calc radius of fresnel zone 2
+    radius = np.sqrt((2 * wavelength * d1 * d2) / (d1 + d2))
+    return radius
+
+# fresnel zone "line" creator
+def fresnel_zone(start_point, end_point, freq_mhz, line_color):
+    fresnel_patches = []
+    # Calculate the distance and angle between the transmitter and receiver
+    dx = end_point[1] - start_point[1]
+    dy = end_point[0] - start_point[0]
+    path_length = np.sqrt(dx**2 + dy**2)
+    angle_deg = np.degrees(np.arctan2(dy, dx))
+
+    num_ellipses = int(path_length / 5)
+    num_ellipses = max(50, min(num_ellipses, 1000))
+
+    # Calculate the Fresnel zone radius at each point 
+    for n in range(num_ellipses + 1):
+        # calc fresnel zone radius at n-th ellipse
+        d1 = path_length * (n / num_ellipses)
+        d2 = path_length - d1
+        r2 = fresnel_zone2_radius(freq_mhz, d1, d2)
+
+        # Position along path
+        x_center = start_point[1] + dx * (n / num_ellipses)
+        y_center = start_point[0] + dy * (n / num_ellipses)
+
+        # Create ellipse with diameter = 2*r2 for width and height (circle cross-section)
+        ellipse = Ellipse((x_center, y_center), width=2*r2, height=2*r2,
+                              angle=angle_deg, edgecolor="none", facecolor=line_color, alpha=1)
+        fresnel_patches.append(ellipse)
+
+    return fresnel_patches
 
 def export_to_shapefile(full_output_path, paths, attributes, epsg_code):
     """
@@ -108,6 +167,21 @@ def export_to_shapefile(full_output_path, paths, attributes, epsg_code):
         gdf['Path_Number'] = gdf['Path_Number'].astype(str)
         gdf.to_file(full_output_path, driver='ESRI Shapefile')
 
+        # --- ZIP all shapefile components ---
+        base = os.path.splitext(full_output_path)[0]
+        shapefile_dir = os.path.dirname(full_output_path)
+        shapefile_files = [f for f in os.listdir(shapefile_dir) if f.startswith(os.path.basename(base))]
+
+        zip_path = base + ".zip"
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for filename in shapefile_files:
+                file_path = os.path.join(shapefile_dir, filename)
+                zipf.write(file_path, arcname=filename)  # arcname avoids full paths
+
+        # --- Remove loose shapefile files ---
+        for filename in shapefile_files:
+            os.remove(os.path.join(shapefile_dir, filename))
+
         print(f"Success! Shapefile saved to: {full_output_path}")
         messagebox.showinfo("Export Successful", f"{len(paths)} paths exported to:\n{full_output_path}")
 
@@ -115,9 +189,45 @@ def export_to_shapefile(full_output_path, paths, attributes, epsg_code):
         print(f"An error occurred during export: {e}")
         messagebox.showerror("Export Error", f"Could not create the Shapefile.\nError: {e}")
 
+def precompute_edge_distances(paths, site_coords, frequencies):
+    """
+    Precomputes the distance from the WT to the edge of the 2nd Fresnel zone
+    for each path and returns a list of those distances in feet.
+    """
+    from shapely.geometry import LineString, Point
+
+    wt_point = Point(site_coords[0], site_coords[1])
+    edge_distances = []
+
+    for i, path in enumerate(paths):
+        start_point, end_point = path
+
+        # Create LineString from the path (x = easting, y = northing)
+        path_line = LineString([(start_point[1], start_point[0]), (end_point[1], end_point[0])])
+        closest_point = path_line.interpolate(path_line.project(wt_point))
+        dist_to_path = wt_point.distance(closest_point)
+
+        # Distance from endpoints
+        p_start = Point(start_point[1], start_point[0])
+        p_end = Point(end_point[1], end_point[0])
+        d1 = p_start.distance(closest_point)
+        d2 = p_end.distance(closest_point)
+
+        # Compute 2nd Fresnel radius and clearance
+        freq_mhz = frequencies[i]
+        radius = fresnel_zone2_radius(freq_mhz, d1, d2)
+        edge_dist = dist_to_path - radius
+        edge_dist_ft = edge_dist * 3.28084
+
+        edge_distances.append(edge_dist_ft)
+
+    return edge_distances
 
 # --- MODIFIED FUNCTION ---
-def open_plot_window(parent, paths, x_range, y_range, legend_info, site_coords, radius, input_filepath, epsg_code):
+def open_plot_window(parent, paths, x_range, y_range, legend_info, site_coords, radius,
+                     input_filepath, epsg_code, frequencies):
+
+
     """
     Opens a NEW Tkinter window to display the Matplotlib plot.
     """
@@ -136,41 +246,94 @@ def open_plot_window(parent, paths, x_range, y_range, legend_info, site_coords, 
     ax.add_artist(circle)
     radius_handle = plt.Line2D([], [], color='blue', linestyle='--', label=f'{radius} mi Radius')
 
+    # Adjust zoom to show just the circle area (with some buffer)
+    buffer = radius_meters * 1.1  # 10% padding
+    x_center, y_center = site_coords
+    home_xlim = (x_center - buffer, x_center + buffer)
+    home_ylim = (y_center - buffer, y_center + buffer)
+
+    # Set plot limits to the buffered circle area
+    ax.set_xlim(home_xlim)
+    ax.set_ylim(home_ylim)
+
     # Plot each path individually
     all_path_lines = []
+    all_fresnel_patches = []
+    bright_colors = [
+        "#FF0000",  # bright red
+        "#00FFFF",  # cyan
+        "#FFFF00",  # yellow
+        "#006400",   # DarkGreen
+        "#FF00FF",  # magenta
+        "#FFA500",  # orange
+        "#00BFFF",  # deep sky blue
+        "#FF1493",  # deep pink
+        "#9B30FF",  # electric purple
+        "#1E90FF"   # dodger blue
+    ]   
+
+    # compute the min distance from the WT to the edge of the 2nd Fresnel zone (for hover tooltip)
+    precomputed_edge_dists = precompute_edge_distances(paths, site_coords, frequencies)
+
     for i, path in enumerate(paths):
         callsign, path_no = legend_info[i]
         start_point, end_point = path
         x_coords = [start_point[1], end_point[1]]
         y_coords = [start_point[0], end_point[0]]
 
+        line_color = bright_colors[i % len(bright_colors)]
         line, = ax.plot(x_coords, y_coords, marker='o', markersize=3, linestyle='-',
-                        label=f'{callsign} No.{path_no}')
+                        label=f'{callsign} No.{path_no}', linewidth = .5, color = line_color)
 
+        
         # Store unique ID on the line object for the hover tooltip
         line.set_gid(f"{callsign} No.{path_no}")
         all_path_lines.append(line)
 
-    # --- Interactive Legend Setup ---
-    handles, labels = ax.get_legend_handles_labels()
-    handles.insert(1, radius_handle)
-    leg = ax.legend(handles=handles, loc='upper left', bbox_to_anchor=(1.02, 1), title="Paths (Click to toggle)")
+        # --- Fresnel zones ---
+        freq_mhz = frequencies[i]  # Frequency in MHz
+        fresnel_ellipses = fresnel_zone(start_point, end_point, freq_mhz, line_color)
+        
+        # add each ellipse to the axes and track it
+        for ellipse in fresnel_ellipses:
+            ax.add_patch(ellipse)
+        all_fresnel_patches.append(fresnel_ellipses)
 
-    # Map legend items to their corresponding plot lines
     legend_map = {}
-    path_legend_handles = leg.legend_handles[2:]  # Skip Site and Radius handles
-    for handle, line in zip(path_legend_handles, all_path_lines):
-        handle.set_picker(5)  # Enable clicking on legend items
-        legend_map[handle] = line
+
+    # Manually create the legend entries to maintain 1:1 mapping
+    custom_handles = [plt.Line2D([], [], color=line.get_color(), label=line.get_label()) for line in all_path_lines]
+    custom_handles.insert(0, radius_handle)  # Optional: put radius after site
+    custom_handles.insert(0, plt.Line2D([], [], color='red', marker='o', linestyle='', label='Site Location'))
+
+    leg = ax.legend(handles=custom_handles, loc='upper left', bbox_to_anchor=(1.02, 1), title="Paths (Click to toggle)")
+
+    # Now, re-map properly
+    path_legend_handles = leg.legend_handles[2:]  # Skip site and radius
+    for i, handle in enumerate(path_legend_handles):
+        handle.set_picker(5)
+        legend_map[handle] = {
+            'line': all_path_lines[i],
+            'ellipses': all_fresnel_patches[i]
+        }
+
 
     # Click handler for toggling individual paths via the legend
     def on_pick(event):
         legend_handle = event.artist
         if legend_handle not in legend_map: return
 
-        line = legend_map[legend_handle]
-        line.set_visible(not line.get_visible())
-        legend_handle.set_alpha(1.0 if line.get_visible() else 0.2)
+        entry = legend_map[legend_handle]
+        line = entry['line']
+        ellipses = entry['ellipses']
+
+        new_visibility = not line.get_visible()
+        line.set_visible(new_visibility)
+
+        for ellipse in ellipses:
+            ellipse.set_visible(new_visibility)
+
+        legend_handle.set_alpha(1.0 if new_visibility else 0.2)
         fig.canvas.draw_idle()
 
     # --- Hover Tooltip Setup ---
@@ -180,19 +343,69 @@ def open_plot_window(parent, paths, x_range, y_range, legend_info, site_coords, 
 
     # Mouse move handler to show path details on hover
     def on_hover(event):
-        if not event.inaxes == ax: return
+        global last_hover_time
+    
+        now = time.time()
+        if now - last_hover_time < hover_interval:
+            return  # skip processing to throttle
+
+        last_hover_time = now
+
+        if not event.inaxes == ax:
+            return
 
         is_annot_visible = False
-        for line in all_path_lines:
+        for i, line in enumerate(all_path_lines):
             if line.get_visible() and line.contains(event)[0]:
-                annot.set_text(line.get_gid())
-                annot.set_visible(True)
+                label = line.get_gid()
+                edge_dist_ft = precomputed_edge_dists[i]
+                annot.set_text(f"{label}\nMin dist to Fresnel edge: {edge_dist_ft:.1f} ft")
                 annot.xy = (event.xdata, event.ydata)
+                annot.set_visible(True)
                 is_annot_visible = True
                 break
+
         if not is_annot_visible and annot.get_visible():
             annot.set_visible(False)
+
         fig.canvas.draw_idle()
+
+    def on_scroll(event):
+        base_scale = 1.2
+        ax = event.inaxes
+        if ax is None:
+            return
+
+        # Get current limits
+        cur_xlim = ax.get_xlim()
+        cur_ylim = ax.get_ylim()
+
+        xdata = event.xdata  # get event x location
+        ydata = event.ydata  # get event y location
+
+        if event.button == 'up':
+            # zoom in
+            scale_factor = 1 / base_scale
+        elif event.button == 'down':
+            # zoom out
+            scale_factor = base_scale
+        else:
+            scale_factor = 1
+            print(event.button)
+
+        new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
+        new_height = (cur_ylim[1] - cur_ylim[0]) * scale_factor
+
+        relx = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
+        rely = (cur_ylim[1] - ydata) / (cur_ylim[1] - cur_ylim[0])
+
+        ax.set_xlim([xdata - new_width * (1-relx), xdata + new_width * relx])
+        ax.set_ylim([ydata - new_height * (1-rely), ydata + new_height * rely])
+        ax.figure.canvas.draw_idle()
+
+        # refresh map view
+        if basemap_on[0]:
+            add_basemap()
 
     # --- "Toggle All" Button Setup ---
     button_ax_toggle = fig.add_axes([0.80, 0.15, 0.15, 0.04])  # Define button position
@@ -201,14 +414,76 @@ def open_plot_window(parent, paths, x_range, y_range, legend_info, site_coords, 
     def on_toggle_clicked(event):
         if not all_path_lines: return
         target_visible = not all_path_lines[0].get_visible()
-        for line in all_path_lines:
+        for i, line in enumerate(all_path_lines):
             line.set_visible(target_visible)
+            for ellipse in all_fresnel_patches[i]:
+                ellipse.set_visible(target_visible)
+
         for handle in path_legend_handles:
             handle.set_alpha(1.0 if target_visible else 0.2)
         fig.canvas.draw_idle()
 
     toggle_button.on_clicked(on_toggle_clicked)
     fig._toggle_button = toggle_button  # Keep a reference to prevent garbage collection
+
+    # --- Basemap ---
+    basemap_on = [False]  # mutable toggle state
+
+    def remove_basemap():
+        # Safely remove all current tile images
+        for img in ax.images[:]:
+            try:
+                img.remove()
+            except Exception:
+                pass
+
+    def add_basemap():
+        try:
+            remove_basemap()  # clear any old basemap tiles
+            ctx.add_basemap(ax, crs=f"EPSG:{epsg_code}",
+                            source=ctx.providers.Esri.WorldImagery,
+                            alpha=0.3)
+
+        except Exception as e:
+            print(f"Could not load basemap: {e}")
+
+    def on_basemap_toggle(event):
+        basemap_on[0] = not basemap_on[0]
+        if basemap_on[0]:
+            add_basemap()
+        else:
+            remove_basemap()
+        fig.canvas.draw_idle()
+
+
+
+    # Now create button axes and widget
+    button_ax = fig.add_axes([0.80, 0.05, 0.15, 0.04])
+    basemap_button = Button(button_ax, 'Toggle Basemap', hovercolor='0.9')
+
+    # Connect the toggle function
+    basemap_button.on_clicked(on_basemap_toggle)
+
+    # Keep a reference so it doesn't get garbage collected
+    fig._basemap_button = basemap_button
+
+
+
+    # --- Home Button ---
+    button_ax_home = fig.add_axes([0.80, 0.20, 0.15, 0.04])
+    home_button = Button(button_ax_home, 'Home', hovercolor='0.9')
+
+    def on_home(event):
+        ax.set_xlim(home_xlim)
+        ax.set_ylim(home_ylim)
+
+        if basemap_on[0]:
+            add_basemap()
+
+        fig.canvas.draw_idle()
+
+    home_button.on_clicked(on_home)
+    fig._home_button = home_button
 
     # --- "Export" Button Setup ---
     button_ax_export = fig.add_axes([0.80, 0.10, 0.15, 0.04])
@@ -235,6 +510,31 @@ def open_plot_window(parent, paths, x_range, y_range, legend_info, site_coords, 
     export_button.on_clicked(on_export_clicked)
     fig._export_button = export_button  # Keep a reference
 
+    # -- Dragging the map ---
+    prev_xlim = [None]
+    prev_ylim = [None]
+    is_updating_basemap = [False]
+
+    def on_limits_change(event_ax):
+        if not basemap_on[0] or is_updating_basemap[0]:
+            return
+
+        new_xlim = ax.get_xlim()
+        new_ylim = ax.get_ylim()
+
+        if prev_xlim[0] == new_xlim and prev_ylim[0] == new_ylim:
+            return
+
+        try:
+            is_updating_basemap[0] = True
+            prev_xlim[0] = new_xlim
+            prev_ylim[0] = new_ylim
+            add_basemap()
+            fig.canvas.draw_idle()
+        finally:
+            is_updating_basemap[0] = False
+
+
     # --- Final Plot Configuration ---
     ax.set_xlim(x_range)
     ax.set_ylim(y_range)
@@ -247,16 +547,23 @@ def open_plot_window(parent, paths, x_range, y_range, legend_info, site_coords, 
     # --- Tkinter Integration ---
     canvas = FigureCanvasTkAgg(fig, master=plot_window)
     canvas.draw()
-    canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
-
     # Add the Matplotlib toolbar (zoom, save, etc.)
     toolbar = NavigationToolbar2Tk(canvas, plot_window)
     toolbar.update()
+
     canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
+    toolbar.pan()
+
 
     # Connect events to the new canvas
     canvas.mpl_connect('pick_event', on_pick)
     canvas.mpl_connect('motion_notify_event', on_hover)
+    canvas.mpl_connect('scroll_event', on_scroll)
+    ax.callbacks.connect('xlim_changed', on_limits_change)
+    ax.callbacks.connect('ylim_changed', on_limits_change)
+
+
+
 
     # DO NOT USE plt.show()
     # plt.show()
@@ -295,11 +602,13 @@ def start_generation():
         # Obtain plot axis ranges
         x_range, y_range, to_utm, epsg_code = calculate_axis_ranges(site_lat, site_long, path_radius + 1)
         site_coords_utm = to_utm.transform(site_long, site_lat)
-        paths, additional_info = get_list_of_paths(mw_path_df, to_utm)
+        paths, additional_info, frequencies = get_list_of_paths(mw_path_df, to_utm)
+
 
         # Call the new function that opens the plot window
         open_plot_window(root, paths, x_range, y_range, additional_info, site_coords_utm, path_radius,
-                         input_filepath=filepath, epsg_code=epsg_code)
+                 input_filepath=filepath, epsg_code=epsg_code, frequencies=frequencies)
+
 
     except Exception as e:
         # If something fails, show a clear error message.
