@@ -22,6 +22,7 @@ import zipfile
 import contextily as ctx
 from shapely.geometry import LineString, Point
 from matplotlib.widgets import Button
+from matplotlib.collections import PatchCollection
 import time
 
 # global abriables for dragging detection
@@ -123,34 +124,45 @@ def fresnel_zone2_radius(freq_mhz, d1, d2):
     return radius
 
 # fresnel zone "line" creator
-def fresnel_zone(start_point, end_point, freq_mhz, line_color):
-    fresnel_patches = []
-    # Calculate the distance and angle between the transmitter and receiver
+def fresnel_zone(start_point, end_point, freq_mhz, line_color, wide_factor=5.0):
+    """
+    Create a PatchCollection of widened Fresnel zone ellipses along a path.
+    - wide_factor stretches ellipses along the path to reduce count.
+    - Height stays correct to Fresnel radius.
+    """
+    # Calculate path geometry
     dx = end_point[1] - start_point[1]
     dy = end_point[0] - start_point[0]
     path_length = np.sqrt(dx**2 + dy**2)
     angle_deg = np.degrees(np.arctan2(dy, dx))
 
-    num_ellipses = int(path_length / 5)
-    num_ellipses = max(50, min(num_ellipses, 1000))
+    # Reduced ellipse count for speed
+    num_ellipses = int(path_length / 20)  # was /5, now less
+    num_ellipses = max(10, min(num_ellipses, 300))  # fewer than before
 
-    # Calculate the Fresnel zone radius at each point 
+    patches = []
+
     for n in range(num_ellipses + 1):
-        # calc fresnel zone radius at n-th ellipse
         d1 = path_length * (n / num_ellipses)
         d2 = path_length - d1
-        r2 = fresnel_zone2_radius(freq_mhz, d1, d2)
+        r2 = fresnel_zone2_radius(freq_mhz, d1, d2)  # height radius stays accurate
 
-        # Position along path
+        # Position
         x_center = start_point[1] + dx * (n / num_ellipses)
         y_center = start_point[0] + dy * (n / num_ellipses)
 
-        # Create ellipse with diameter = 2*r2 for width and height (circle cross-section)
-        ellipse = Ellipse((x_center, y_center), width=2*r2, height=2*r2,
-                              angle=angle_deg, edgecolor="none", facecolor=line_color, alpha=1)
-        fresnel_patches.append(ellipse)
+        # Ellipse: major axis stretched, minor axis is true Fresnel diameter
+        major_axis = (path_length / num_ellipses) * wide_factor
+        minor_axis = 2 * r2
 
-    return fresnel_patches
+        patches.append(Ellipse((x_center, y_center),
+                                width=major_axis,
+                                height=minor_axis,
+                                angle=angle_deg))
+
+    # One PatchCollection for speed
+    collection = PatchCollection(patches, facecolor=line_color, alpha=1, edgecolor='none')
+    return collection
 
 def export_to_shapefile(full_output_path, paths, attributes, epsg_code):
     """
@@ -292,12 +304,12 @@ def open_plot_window(parent, paths, x_range, y_range, legend_info, site_coords, 
 
         # --- Fresnel zones ---
         freq_mhz = frequencies[i]  # Frequency in MHz
-        fresnel_ellipses = fresnel_zone(start_point, end_point, freq_mhz, line_color)
+        fresnel_collection = fresnel_zone(start_point, end_point, freq_mhz, line_color)
         
-        # add each ellipse to the axes and track it
-        for ellipse in fresnel_ellipses:
-            ax.add_patch(ellipse)
-        all_fresnel_patches.append(fresnel_ellipses)
+        ax.add_collection(fresnel_collection)
+
+        # Track the collection for toggling or clearing later
+        all_fresnel_patches.append(fresnel_collection)
 
     legend_map = {}
 
